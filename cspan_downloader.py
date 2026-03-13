@@ -325,7 +325,7 @@ def download_video(video_url, output_dir=".", format_pref="mp4", quiet=False):
         "ignoreerrors": False,
         "retries": 3,
         "fragment_retries": 5,
-        "concurrent_fragment_downloads": 8,
+        "concurrent_fragment_downloads": 4,
     }
 
     try:
