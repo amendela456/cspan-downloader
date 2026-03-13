@@ -325,7 +325,6 @@ def download_video(video_url, output_dir=".", format_pref="mp4", quiet=False):
         "ignoreerrors": False,
         "retries": 3,
         "fragment_retries": 5,
-        "concurrent_fragment_downloads": 2,
     }
 
     try:
@@ -458,7 +457,7 @@ Examples:
         help="Suppress yt-dlp download output",
     )
     parser.add_argument(
-        "--parallel", "-p", type=int, default=2,
+        "--parallel", "-p", type=int, default=1,
         help="Number of parallel downloads (default: 3)",
     )
 
