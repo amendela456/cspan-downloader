@@ -19,10 +19,12 @@ Requirements:
 """
 
 import argparse
+import http.cookiejar
 import json
 import os
 import re
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -250,6 +252,42 @@ def search_cspan_videos(politician_name, max_results=100):
 
 
 # ---------------------------------------------------------------------------
+# Cookie helpers — C-SPAN CDN requires browser cookies for .ts fragments
+# ---------------------------------------------------------------------------
+
+def _get_cspan_cookies():
+    """
+    Visit C-SPAN with Playwright to obtain cookies needed for CDN access.
+    Returns the path to a Netscape-format cookie jar file.
+    """
+    cookie_path = os.path.join(tempfile.gettempdir(), "cspan_cookies.txt")
+
+    with sync_playwright() as pw:
+        browser, page = _launch_browser(pw)
+        try:
+            page.goto(CSPAN_BASE, wait_until="domcontentloaded", timeout=30000)
+            time.sleep(5)  # Let WAF challenge resolve
+            cookies = page.context.cookies()
+        finally:
+            browser.close()
+
+    # Write Netscape cookie jar format
+    with open(cookie_path, "w") as f:
+        f.write("# Netscape HTTP Cookie File\n")
+        for c in cookies:
+            domain = c.get("domain", "")
+            flag = "TRUE" if domain.startswith(".") else "FALSE"
+            path = c.get("path", "/")
+            secure = "TRUE" if c.get("secure") else "FALSE"
+            expires = str(int(c.get("expires", 0)))
+            name = c.get("name", "")
+            value = c.get("value", "")
+            f.write(f"{domain}\t{flag}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
+
+    return cookie_path
+
+
+# ---------------------------------------------------------------------------
 # Download
 # ---------------------------------------------------------------------------
 
@@ -295,7 +333,7 @@ def _resolve_cspan_url(video_url):
     return video_url
 
 
-def download_video(video_url, output_dir=".", format_pref="mp4", quiet=False):
+def download_video(video_url, output_dir=".", format_pref="mp4", quiet=False, cookie_file=None):
     """
     Download a single C-SPAN video using yt-dlp.
     Returns the path to the downloaded file, or None on failure.
@@ -326,6 +364,9 @@ def download_video(video_url, output_dir=".", format_pref="mp4", quiet=False):
         "retries": 3,
         "fragment_retries": 5,
     }
+
+    if cookie_file:
+        ydl_opts["cookiefile"] = cookie_file
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -384,6 +425,11 @@ def search_and_download(
     print(f"\nDownloading to: {output_dir}\n")
     os.makedirs(output_dir, exist_ok=True)
 
+    # Grab cookies from C-SPAN — required for CDN fragment access
+    print("  Obtaining CDN cookies...")
+    cookie_file = _get_cspan_cookies()
+    print(f"  Cookies saved to {cookie_file}")
+
     meta_path = os.path.join(output_dir, "metadata.json")
     with open(meta_path, "w") as f:
         json.dump({"politician": politician_name, "videos": videos}, f, indent=2)
@@ -393,6 +439,7 @@ def search_and_download(
         print(f"\n[{idx}/{len(videos)}] Downloading: {v['title']}")
         path = download_video(
             v["url"], output_dir=output_dir, format_pref=format_pref, quiet=quiet,
+            cookie_file=cookie_file,
         )
         v["downloaded_path"] = path
         if path:
@@ -466,9 +513,12 @@ Examples:
     if args.url:
         output = args.output or "."
         os.makedirs(output, exist_ok=True)
+        print("Obtaining CDN cookies...")
+        cookie_file = _get_cspan_cookies()
         print(f"Downloading: {args.url}")
         path = download_video(
             args.url, output_dir=output, format_pref=args.format, quiet=args.quiet,
+            cookie_file=cookie_file,
         )
         if path:
             print(f"Saved: {path}")
