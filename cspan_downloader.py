@@ -351,7 +351,7 @@ def download_video(video_url, output_dir=".", format_pref="mp4", quiet=False, co
     )
 
     ydl_opts = {
-        "format": "bestvideo+bestaudio/best",
+        "format": "best[height<=360]/worst",
         "merge_output_format": format_pref,
         "outtmpl": outtmpl,
         "http_headers": {
@@ -504,8 +504,8 @@ Examples:
         help="Suppress yt-dlp download output",
     )
     parser.add_argument(
-        "--parallel", "-p", type=int, default=1,
-        help="Number of parallel downloads (default: 3)",
+        "--parallel", "-p", type=int, default=2,
+        help="Number of parallel downloads (default: 2)",
     )
 
     args = parser.parse_args()
