@@ -4,18 +4,18 @@ C-SPAN Video Downloader
 -----------------------
 Search and download C-SPAN videos by politician name.
 
-Uses two search strategies:
-  1. Direct C-SPAN search (scrapes c-span.org/search/)
-  2. Google fallback (if C-SPAN blocks with WAF challenge)
-
-Downloads are handled by yt-dlp which has native C-SPAN support.
+Uses Playwright (headless browser) to bypass C-SPAN's WAF protection,
+then yt-dlp to download videos.
 
 Usage:
-    python cspan_downloader.py "Nancy Pelosi"
-    python cspan_downloader.py "Nancy Pelosi" --max 5 --output ./videos
+    python cspan_downloader.py "Eli Crane"
+    python cspan_downloader.py "Nancy Pelosi" --max 10 --output ./videos
     python cspan_downloader.py "Mitch McConnell" --list-only
-    python cspan_downloader.py "Ted Cruz" --max 3 --format mp4
-    python cspan_downloader.py --url "https://www.c-span.org/program/..." --output ./video
+    python cspan_downloader.py --url "https://www.c-span.org/program/..." -o ./video
+
+Requirements:
+    pip install playwright yt-dlp beautifulsoup4 requests
+    python -m playwright install chromium
 """
 
 import argparse
@@ -36,109 +36,133 @@ except ImportError:
     print("Error: yt-dlp is required. Install with: pip install yt-dlp")
     sys.exit(1)
 
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    print("Error: playwright is required. Install with:")
+    print("  pip install playwright && python -m playwright install chromium")
+    sys.exit(1)
+
 
 CSPAN_BASE = "https://www.c-span.org"
-CSPAN_SEARCH_URL = "https://www.c-span.org/search/"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
-# C-SPAN URL patterns that yt-dlp can handle
-CSPAN_VIDEO_PATTERN = re.compile(
-    r"https?://(?:www\.)?c-span\.org/(?:program|video|clip)/[^\s\"'>]+"
-)
-
 
 # ---------------------------------------------------------------------------
-# Search strategies
+# Playwright browser helpers
 # ---------------------------------------------------------------------------
 
-def _make_session():
-    """Create a requests session with browser-like headers."""
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate",
-        "Connection": "keep-alive",
-    })
-    return session
+def _launch_browser(playwright):
+    """Launch a stealth Chromium browser."""
+    browser = playwright.chromium.launch(
+        headless=True,
+        args=["--disable-blink-features=AutomationControlled"],
+    )
+    ctx = browser.new_context(
+        user_agent=USER_AGENT,
+        viewport={"width": 1920, "height": 1080},
+        locale="en-US",
+    )
+    page = ctx.new_page()
+    page.add_init_script(
+        'Object.defineProperty(navigator, "webdriver", { get: () => undefined });'
+    )
+    return browser, page
 
 
-def _normalize_cspan_url(href):
-    """Normalize a C-SPAN URL to a full https URL."""
+def _wait_for_cspan(page, timeout=15):
+    """Wait for C-SPAN page to load past the WAF challenge."""
+    for _ in range(timeout):
+        title = page.title()
+        if title and "request could not" not in title.lower():
+            count = page.locator("li.onevid").count()
+            if count > 0:
+                return True
+        time.sleep(1)
+    return False
+
+
+def _normalize_url(href):
+    """Normalize a C-SPAN URL to full https."""
     if not href:
         return None
     if href.startswith("//"):
-        href = "https:" + href
-    elif href.startswith("/"):
-        href = CSPAN_BASE + href
-    if not href.startswith("http"):
+        return "https:" + href
+    if href.startswith("/"):
+        return CSPAN_BASE + href
+    if href.startswith("http"):
+        return href
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Search: find person page URL via DuckDuckGo
+# ---------------------------------------------------------------------------
+
+def _find_person_page(politician_name):
+    """Use DuckDuckGo to find the politician's C-SPAN person page URL."""
+    query = f'site:c-span.org/person {politician_name}'
+    url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote_plus(query)}"
+
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": USER_AGENT, "Accept": "text/html",
+        })
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception:
         return None
-    # Remove URL-encoded fragments and tracking params
-    href = href.split("&")[0] if "&utm" in href else href
-    return href
+
+    soup = BeautifulSoup(html, "html.parser")
+    name_lower = politician_name.lower()
+    name_parts = name_lower.split()
+
+    for a in soup.select(".result__a"):
+        href = a.get("href", "")
+        if "uddg=" in href:
+            match = re.search(r"uddg=([^&]+)", href)
+            if match:
+                href = urllib.parse.unquote(match.group(1))
+        if "c-span.org/person/" not in href:
+            continue
+        link_text = a.get_text(strip=True).lower()
+        if all(part in link_text for part in name_parts):
+            return href.rstrip("/") + "/"
+
+    return None
 
 
-def search_cspan_direct(politician_name, max_results=10):
-    """
-    Search C-SPAN directly. Returns list of video dicts.
-    May fail if C-SPAN's AWS WAF blocks the request.
-    """
-    session = _make_session()
-    session.headers["Referer"] = CSPAN_BASE
+def _extract_person_id(person_url):
+    """Extract numeric person ID from a C-SPAN person URL."""
+    match = re.search(r"/(\d+)/?$", person_url)
+    return match.group(1) if match else None
 
-    params = {"query": politician_name, "searchtype": "Videos"}
 
-    for attempt in range(3):
-        try:
-            resp = session.get(CSPAN_SEARCH_URL, params=params, timeout=30)
-            if resp.status_code == 200 and len(resp.text) > 1000 and "awsWaf" not in resp.text:
-                break
-        except requests.RequestException:
-            pass
-        time.sleep(2 * (attempt + 1))
-    else:
-        return None  # Signal that direct search failed (WAF or error)
+# ---------------------------------------------------------------------------
+# Search: Playwright-based scraping of C-SPAN search results
+# ---------------------------------------------------------------------------
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    items = soup.select("li.onevid")
-
+def _scrape_search_page(page):
+    """Extract video info from the current Playwright page's li.onevid items."""
     videos = []
+    items = page.locator("li.onevid").all()
+
     for item in items:
-        if len(videos) >= max_results:
-            break
+        title_el = item.locator("a.title h3").first
+        time_el = item.locator("time").first
+        link_el = item.locator("a.title").first
+        abstract_el = item.locator("p.abstract").first
 
-        title_link = item.select_one("a.title")
-        thumb_link = item.select_one("a.thumb")
-        link = title_link or thumb_link
-        if not link:
-            continue
+        title = title_el.text_content().strip() if title_el.count() else ""
+        date = time_el.get_attribute("datetime") if time_el.count() else ""
+        href = link_el.get_attribute("href") if link_el.count() else ""
+        description = abstract_el.text_content().strip()[:300] if abstract_el.count() else ""
 
-        url = _normalize_cspan_url(link.get("href", ""))
-        if not url or ("/program/" not in url and "/video/" not in url and "/clip/" not in url):
-            continue
-
-        title = ""
-        h3 = item.select_one("a.title h3")
-        if h3:
-            title = h3.get_text(strip=True)
-        elif title_link:
-            title = title_link.get_text(strip=True)
-
-        date = ""
-        time_el = item.select_one("time[datetime]")
-        if time_el:
-            date = time_el.get_text(strip=True)
-
-        description = ""
-        abstract = item.select_one("p.abstract")
-        if abstract:
-            description = abstract.get_text(strip=True)[:300]
-
-        if url and title:
+        url = _normalize_url(href)
+        if url and title and ("/program/" in url or "/video/" in url or "/clip/" in url):
             videos.append({
                 "title": title,
                 "url": url,
@@ -149,95 +173,79 @@ def search_cspan_direct(politician_name, max_results=10):
     return videos
 
 
-def search_web_fallback(politician_name, max_results=10):
+def search_cspan_videos(politician_name, max_results=100):
     """
-    Use DuckDuckGo HTML search to find C-SPAN video URLs for a politician.
-    This bypasses C-SPAN's WAF since we're querying a search engine, not C-SPAN.
+    Search C-SPAN for all videos featuring a politician.
+
+    Strategy:
+      1. Find the politician's C-SPAN person page via DuckDuckGo
+      2. Use Playwright to browse the search filtered by person ID
+      3. Paginate through all results (20 per page)
+      4. Fall back to name-based search if person page not found
     """
-    query = f'site:c-span.org "{politician_name}" video'
-    url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote_plus(query)}"
+    # Step 1: Find person page to get the person ID
+    print("  Finding person page...")
+    person_url = _find_person_page(politician_name)
+    person_id = _extract_person_id(person_url) if person_url else None
 
-    req = urllib.request.Request(url, headers={
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html",
-    })
+    if person_id:
+        print(f"  Found: {person_url}")
+        search_url = (
+            f"{CSPAN_BASE}/search/?searchtype=Videos&sort=Newest"
+            f"&personid[]={person_id}"
+        )
+    else:
+        print("  Person page not found, searching by name...")
+        search_url = (
+            f"{CSPAN_BASE}/search/?searchtype=Videos&sort=Newest"
+            f"&query={urllib.parse.quote_plus(politician_name)}"
+        )
 
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        print(f"  Web search failed: {e}", file=sys.stderr)
-        return []
-
-    soup = BeautifulSoup(html, "html.parser")
+    # Step 2: Use Playwright to scrape paginated results
+    print("  Loading search results (browser)...")
     videos = []
     seen_urls = set()
 
-    # DuckDuckGo HTML results are in .result elements with .result__a links
-    results = soup.select(".result__a")
-    for a in results:
-        href = a.get("href", "")
+    with sync_playwright() as pw:
+        browser, page = _launch_browser(pw)
 
-        # DuckDuckGo wraps URLs in uddg= parameter
-        if "uddg=" in href:
-            match = re.search(r"uddg=([^&]+)", href)
-            if match:
-                href = urllib.parse.unquote(match.group(1))
+        try:
+            pg = 1
+            while len(videos) < max_results:
+                url = search_url if pg == 1 else f"{search_url}&page={pg}"
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-        # Check if it's a C-SPAN video/program/clip URL
-        if not re.search(r"c-span\.org/(program|video|clip)/", href):
-            continue
+                if not _wait_for_cspan(page):
+                    if pg == 1:
+                        print("  Failed to load search results (WAF blocked).")
+                        break
+                    else:
+                        break  # No more pages
 
-        # Skip person pages, search pages, etc.
-        if "/person/" in href or "/search/" in href:
-            continue
+                new_videos = _scrape_search_page(page)
+                if not new_videos:
+                    break
 
-        # Deduplicate
-        clean_url = href.split("&")[0].rstrip("/")
-        if clean_url in seen_urls:
-            continue
-        seen_urls.add(clean_url)
+                new_count = 0
+                for v in new_videos:
+                    key = v["url"].rstrip("/")
+                    if key not in seen_urls:
+                        seen_urls.add(key)
+                        videos.append(v)
+                        new_count += 1
 
-        # Extract title from the link text
-        title = a.get_text(strip=True)
-        # Clean up " | Video | C-SPAN.org" suffix
-        title = re.sub(r"\s*\|\s*(?:Video|C-SPAN\.org)\s*", "", title).strip(" |")
+                print(f"  Page {pg}: {new_count} new videos (total: {len(videos)})")
 
-        if not title:
-            slug_match = re.search(r"/(?:program|video|clip)/[^/]+/([^/]+)", clean_url)
-            if slug_match:
-                title = slug_match.group(1).replace("-", " ").title()
+                if new_count == 0 or len(videos) >= max_results:
+                    break
 
-        if clean_url and title:
-            videos.append({
-                "title": title,
-                "url": clean_url,
-                "date": "",
-                "description": "",
-            })
+                pg += 1
+                time.sleep(2)
 
-        if len(videos) >= max_results:
-            break
+        finally:
+            browser.close()
 
-    return videos
-
-
-def search_cspan_videos(politician_name, max_results=10):
-    """
-    Search for C-SPAN videos. Tries direct search first, falls back to Google.
-    """
-    # Try direct C-SPAN search
-    videos = search_cspan_direct(politician_name, max_results)
-    if videos is not None and len(videos) > 0:
-        return videos
-
-    if videos is None:
-        print("  C-SPAN search blocked (WAF), falling back to Google search...")
-    else:
-        print("  No results from C-SPAN direct search, trying Google...")
-
-    # Fallback to web search
-    return search_web_fallback(politician_name, max_results)
+    return videos[:max_results]
 
 
 # ---------------------------------------------------------------------------
@@ -248,51 +256,30 @@ def _resolve_cspan_url(video_url):
     """
     Resolve a C-SPAN URL to a format yt-dlp can handle.
 
-    yt-dlp's CSpan extractor only supports /video/?ID URLs.
-    For /program/ and /clip/ URLs, we try to:
-      1. Fetch the page and find an m3u8 stream or /video/ link
-      2. Construct the m3u8 URL from the numeric ID
-      3. Fall back to the original URL for the generic extractor
+    yt-dlp's CSpan extractor supports /video/?ID URLs.
+    For /program/ URLs, try the m3u8 stream URL.
     """
-    # Already a supported /video/ URL
     if re.match(r"https?://(?:www\.)?c-span\.org/video/\?", video_url):
         return video_url
 
-    # Extract numeric ID from /clip/ or /program/ URLs
     id_match = re.search(r"/(\d+)/?$", video_url)
     if not id_match:
         return video_url
 
     numeric_id = id_match.group(1)
 
-    # Try to fetch the page and find the underlying video URL or m3u8
-    session = _make_session()
-    try:
-        resp = session.get(video_url, timeout=30)
-        if resp.status_code == 200 and len(resp.text) > 1000 and "awsWaf" not in resp.text:
-            # Look for m3u8 stream URL
-            m3u8_match = re.search(r'(https?://[^\s"]+\.m3u8[^\s"]*)', resp.text)
-            if m3u8_match:
-                return m3u8_match.group(1)
-            # Look for /video/?ID links
-            vid_match = re.search(r'c-span\.org/video/\?([a-f0-9]+)', resp.text)
-            if vid_match:
-                return f"https://www.c-span.org/video/?{vid_match.group(1)}"
-    except Exception:
-        pass
-
-    # Try known m3u8 URL patterns. Program URLs use .tsc.m3u8, clips don't.
+    # Try m3u8 URL patterns
     is_clip = "/clip/" in video_url
     if is_clip:
         candidates = [
             f"https://m3u8-0.c-spanvideo.org/clip/clip.{numeric_id}.m3u8",
-            f"https://m3u8-1.c-spanvideo.org/clip/clip.{numeric_id}.m3u8",
         ]
     else:
         candidates = [
             f"https://m3u8-0.c-spanvideo.org/program/program.{numeric_id}.tsc.m3u8",
-            f"https://m3u8-1.c-spanvideo.org/program/program.{numeric_id}.tsc.m3u8",
         ]
+
+    session = requests.Session()
     for pattern in candidates:
         try:
             resp = session.get(
@@ -304,7 +291,6 @@ def _resolve_cspan_url(video_url):
         except Exception:
             continue
 
-    # Return original URL - yt-dlp generic extractor may still handle it
     return video_url
 
 
@@ -315,12 +301,15 @@ def download_video(video_url, output_dir=".", format_pref="mp4", quiet=False):
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Try to resolve to a yt-dlp-compatible URL
     resolved_url = _resolve_cspan_url(video_url)
     if resolved_url != video_url and not quiet:
         print(f"  Resolved to: {resolved_url}")
 
-    outtmpl = os.path.join(output_dir, "%(upload_date>%Y-%m-%d,release_date>%Y-%m-%d,timestamp>%Y-%m-%d|Unknown Date)s - %(title).100s.%(ext)s")
+    outtmpl = os.path.join(
+        output_dir,
+        "%(upload_date>%Y-%m-%d,release_date>%Y-%m-%d,timestamp>%Y-%m-%d|Unknown Date)s"
+        " - %(title).100s.%(ext)s",
+    )
 
     ydl_opts = {
         "format": "bestvideo+bestaudio/best",
@@ -354,43 +343,20 @@ def download_video(video_url, output_dir=".", format_pref="mp4", quiet=False):
         return None
 
 
-def download_single_url(url, output_dir=".", format_pref="mp4", quiet=False):
-    """Download a single C-SPAN URL directly (no search needed)."""
-    os.makedirs(output_dir, exist_ok=True)
-    print(f"Downloading: {url}")
-    path = download_video(url, output_dir=output_dir, format_pref=format_pref, quiet=quiet)
-    if path:
-        print(f"Saved: {path}")
-    else:
-        print("Failed to download.")
-    return path
-
-
 # ---------------------------------------------------------------------------
 # Main workflow
 # ---------------------------------------------------------------------------
 
 def search_and_download(
     politician_name,
-    max_videos=5,
+    max_videos=100,
     output_dir=None,
     format_pref="mp4",
     list_only=False,
     quiet=False,
 ):
     """
-    Main workflow: search for a politician's C-SPAN videos and download them.
-
-    Args:
-        politician_name: Name to search for (e.g. "Nancy Pelosi")
-        max_videos: Maximum number of videos to download
-        output_dir: Directory to save videos (default: ./cspan_{name}/)
-        format_pref: Output format (default: mp4)
-        list_only: If True, just list videos without downloading
-        quiet: Suppress yt-dlp output
-
-    Returns:
-        List of dicts with video info and download paths
+    Search for a politician's C-SPAN videos and download them.
     """
     if output_dir is None:
         output_dir = os.path.join(".", f"{politician_name} CSpan Videos")
@@ -408,8 +374,7 @@ def search_and_download(
         print(f"  {i}. {v['title']}{date_str}")
         print(f"     {v['url']}")
         if v.get("description"):
-            desc = v["description"][:100]
-            print(f"     {desc}")
+            print(f"     {v['description'][:100]}")
 
     if list_only:
         return videos
@@ -417,7 +382,6 @@ def search_and_download(
     print(f"\nDownloading to: {output_dir}\n")
     os.makedirs(output_dir, exist_ok=True)
 
-    # Save metadata
     meta_path = os.path.join(output_dir, "metadata.json")
     with open(meta_path, "w") as f:
         json.dump({"politician": politician_name, "videos": videos}, f, indent=2)
@@ -426,7 +390,7 @@ def search_and_download(
     for i, v in enumerate(videos, 1):
         print(f"\n[{i}/{len(videos)}] Downloading: {v['title']}")
         path = download_video(
-            v["url"], output_dir=output_dir, format_pref=format_pref, quiet=quiet
+            v["url"], output_dir=output_dir, format_pref=format_pref, quiet=quiet,
         )
         v["downloaded_path"] = path
         results.append(v)
@@ -450,10 +414,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s "Nancy Pelosi"
-  %(prog)s "Mitch McConnell" --max 5 --output ./mcconnell_videos
+  %(prog)s "Eli Crane"
+  %(prog)s "Nancy Pelosi" --max 10
   %(prog)s "Ted Cruz" --list-only
-  %(prog)s "Alexandria Ocasio-Cortez" --max 3 --format mp4 --quiet
+  %(prog)s "Mitch McConnell" --max 50 --output ./mcconnell --quiet
   %(prog)s --url "https://www.c-span.org/program/.../12345" -o ./single_video
         """,
     )
@@ -466,8 +430,8 @@ Examples:
         help="Download a specific C-SPAN video URL directly (skip search)",
     )
     parser.add_argument(
-        "--max", "-m", type=int, default=5,
-        help="Max number of videos to download (default: 5)",
+        "--max", "-m", type=int, default=100,
+        help="Max number of videos (default: 100, i.e. all)",
     )
     parser.add_argument(
         "--output", "-o", default=None,
@@ -488,12 +452,17 @@ Examples:
 
     args = parser.parse_args()
 
-    # Direct URL download mode
     if args.url:
         output = args.output or "."
-        path = download_single_url(
-            args.url, output_dir=output, format_pref=args.format, quiet=args.quiet
+        os.makedirs(output, exist_ok=True)
+        print(f"Downloading: {args.url}")
+        path = download_video(
+            args.url, output_dir=output, format_pref=args.format, quiet=args.quiet,
         )
+        if path:
+            print(f"Saved: {path}")
+        else:
+            print("Failed to download.")
         sys.exit(0 if path else 1)
 
     if not args.politician:
