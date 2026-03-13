@@ -26,6 +26,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from bs4 import BeautifulSoup
@@ -324,6 +325,7 @@ def download_video(video_url, output_dir=".", format_pref="mp4", quiet=False):
         "ignoreerrors": False,
         "retries": 3,
         "fragment_retries": 5,
+        "concurrent_fragment_downloads": 8,
     }
 
     try:
@@ -354,6 +356,7 @@ def search_and_download(
     format_pref="mp4",
     list_only=False,
     quiet=False,
+    parallel=3,
 ):
     """
     Search for a politician's C-SPAN videos and download them.
@@ -386,22 +389,27 @@ def search_and_download(
     with open(meta_path, "w") as f:
         json.dump({"politician": politician_name, "videos": videos}, f, indent=2)
 
-    results = []
-    for i, v in enumerate(videos, 1):
-        print(f"\n[{i}/{len(videos)}] Downloading: {v['title']}")
+    def _download_one(idx_video):
+        idx, v = idx_video
+        print(f"\n[{idx}/{len(videos)}] Downloading: {v['title']}")
         path = download_video(
             v["url"], output_dir=output_dir, format_pref=format_pref, quiet=quiet,
         )
         v["downloaded_path"] = path
-        results.append(v)
-
         if path:
-            print(f"  Saved: {path}")
+            print(f"  [{idx}/{len(videos)}] Saved: {path}")
         else:
-            print("  Failed to download.")
+            print(f"  [{idx}/{len(videos)}] Failed to download.")
+        return v
 
-        if i < len(videos):
-            time.sleep(2)
+    workers = max(1, min(parallel, len(videos)))
+    if workers == 1:
+        results = [_download_one((i, v)) for i, v in enumerate(videos, 1)]
+    else:
+        print(f"  (downloading {workers} videos in parallel)\n")
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_download_one, (i, v)) for i, v in enumerate(videos, 1)]
+            results = [f.result() for f in futures]
 
     successful = sum(1 for r in results if r.get("downloaded_path"))
     print(f"\nDone! Downloaded {successful}/{len(results)} videos to {output_dir}")
@@ -449,6 +457,10 @@ Examples:
         "--quiet", "-q", action="store_true",
         help="Suppress yt-dlp download output",
     )
+    parser.add_argument(
+        "--parallel", "-p", type=int, default=3,
+        help="Number of parallel downloads (default: 3)",
+    )
 
     args = parser.parse_args()
 
@@ -475,6 +487,7 @@ Examples:
         format_pref=args.format,
         list_only=args.list_only,
         quiet=args.quiet,
+        parallel=args.parallel,
     )
 
     if not results:
